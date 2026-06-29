@@ -15,6 +15,8 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import uvicorn
 import uuid
+import sqlalchemy
+from databases import Database
 
 # Загружаем переменные из .env файла (если он существует локально)
 load_dotenv()
@@ -27,11 +29,35 @@ if not SITE_URL.startswith(("http://", "https://")):
     SITE_URL = "https://" + SITE_URL
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "Temirlan029.")
 
+# ── Настройки базы данных ──
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./ushunet.db")
+# Фикс для Railway: SQLAlchemy ожидает postgresql://, а не postgres://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+database = Database(DATABASE_URL)
+metadata = sqlalchemy.MetaData()
+
+comments = sqlalchemy.Table(
+    "comments",
+    metadata,
+    sqlalchemy.Column("id", sqlalchemy.String, primary_key=True),
+    sqlalchemy.Column("user_id", sqlalchemy.String, index=True),
+    sqlalchemy.Column("text", sqlalchemy.String),
+    sqlalchemy.Column("timestamp", sqlalchemy.String),
+    sqlalchemy.Column("target_name", sqlalchemy.String),
+)
+
+bios_table = sqlalchemy.Table(
+    "bios",
+    metadata,
+    sqlalchemy.Column("user_id", sqlalchemy.String, primary_key=True),
+    sqlalchemy.Column("text", sqlalchemy.String),
+)
+
 # ── Антиспам настройки ──
 RATE_LIMIT_SECONDS = 120   # 1 сообщение раз в 2 минуты
 MAX_MESSAGE_LENGTH = 500   # Максимум символов
-MESSAGES_FILE = "messages.json"  # Файл хранения сообщений
-BIOS_FILE = "bios.json"          # Файл хранения био участников
 
 intents = discord.Intents.default()
 intents.members = True
@@ -39,6 +65,18 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 app = FastAPI()
+
+@app.on_event("startup")
+async def startup():
+    engine = sqlalchemy.create_engine(
+        DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
+    )
+    metadata.create_all(engine)
+    await database.connect()
+
+@app.on_event("shutdown")
+async def shutdown():
+    await database.disconnect()
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,41 +92,6 @@ rate_limiter: dict[str, float] = {}  # IP -> timestamp последнего со
 
 class MessageIn(BaseModel):
     text: str = Field(..., min_length=2, max_length=MAX_MESSAGE_LENGTH)
-
-
-def load_messages() -> dict[str, list[dict]]:
-    """Загружает комментарии из JSON-файла."""
-    if os.path.exists(MESSAGES_FILE):
-        try:
-            with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-                return {}
-        except (json.JSONDecodeError, IOError):
-            return {}
-    return {}
-
-
-def save_messages(messages: dict[str, list[dict]]):
-    """Сохраняет комментарии в JSON-файл."""
-    with open(MESSAGES_FILE, "w", encoding="utf-8") as f:
-        json.dump(messages, f, ensure_ascii=False, indent=2)
-
-def load_bios() -> dict[str, str]:
-    """Загружает био из JSON-файла."""
-    if os.path.exists(BIOS_FILE):
-        try:
-            with open(BIOS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            return {}
-    return {}
-
-def save_bios(bios: dict[str, str]):
-    """Сохраняет био в JSON-файл."""
-    with open(BIOS_FILE, "w", encoding="utf-8") as f:
-        json.dump(bios, f, ensure_ascii=False, indent=2)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -324,16 +327,21 @@ async def cmd_ping(interaction: discord.Interaction):
 @bot.tree.command(name="bio", description="Рассказать о себе (появится в анкете на сайте)")
 @app_commands.describe(text="Ваше описание (оставьте пустым, чтобы удалить)")
 async def cmd_bio(interaction: discord.Interaction, text: str = None):
-    bios = load_bios()
     user_id = str(interaction.user.id)
     if not text:
-        bios.pop(user_id, None)
-        save_bios(bios)
+        query = bios_table.delete().where(bios_table.c.user_id == user_id)
+        await database.execute(query)
         await interaction.response.send_message("✅ Ваше описание удалено.", ephemeral=True)
     else:
         text = text.strip()[:200]
-        bios[user_id] = text
-        save_bios(bios)
+        query_check = bios_table.select().where(bios_table.c.user_id == user_id)
+        row = await database.fetch_one(query_check)
+        if row:
+            query_update = bios_table.update().where(bios_table.c.user_id == user_id).values(text=text)
+            await database.execute(query_update)
+        else:
+            query_insert = bios_table.insert().values(user_id=user_id, text=text)
+            await database.execute(query_insert)
         await interaction.response.send_message(f"✅ Описание обновлено:\n`{text}`", ephemeral=True)
 
 
@@ -350,8 +358,16 @@ async def get_members():
     if not guild:
         return {"error": f"Сервер с ID {GUILD_ID} не найден в кэше бота."}
 
-    bios = load_bios()
-    all_messages = load_messages()
+    # Fetch all bios
+    bios_query = bios_table.select()
+    bios_rows = await database.fetch_all(bios_query)
+    bios_dict = {row["user_id"]: row["text"] for row in bios_rows}
+    
+    # Fetch comment counts
+    count_query = "SELECT user_id, COUNT(*) as cnt FROM comments GROUP BY user_id"
+    count_rows = await database.fetch_all(count_query)
+    count_dict = {row["user_id"]: row["cnt"] for row in count_rows}
+    
     members_list = []
     
     for member in guild.members:
@@ -388,8 +404,8 @@ async def get_members():
             "roles": [r.name for r in member.roles if r.name != "@everyone"],
             "status": status_str,
             "activity": activity_str,
-            "bio": bios.get(user_id),
-            "comment_count": len(all_messages.get(user_id, [])),
+            "bio": bios_dict.get(user_id),
+            "comment_count": count_dict.get(user_id, 0),
             "_weight": sort_weight
         })
         
@@ -407,10 +423,9 @@ async def get_members():
 
 @app.get("/api/comments/{user_id}")
 async def get_comments(user_id: str):
-    all_messages = load_messages()
-    user_comments = all_messages.get(user_id, [])
-    # Отдаём от новых к старым
-    return {"comments": list(reversed(user_comments))}
+    query = comments.select().where(comments.c.user_id == user_id).order_by(comments.c.timestamp.desc())
+    rows = await database.fetch_all(query)
+    return {"comments": [dict(row) for row in rows]}
 
 
 @app.post("/api/comments/{user_id}")

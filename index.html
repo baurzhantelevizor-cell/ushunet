@@ -858,7 +858,7 @@ async function deleteComment(commentId) {
     try {
         const res = await fetch(`/api/comments/${currentAnketaId}/${commentId}`, {
             method: 'DELETE',
-            headers: { 'Authorization': \`Bearer \${adminToken}\` }
+            headers: { 'Authorization': `Bearer ${adminToken}` }
         });
         const data = await res.json();
         if (data.error) {

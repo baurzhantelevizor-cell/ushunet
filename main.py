@@ -11,6 +11,7 @@ from discord.ext import commands
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import uvicorn
@@ -64,19 +65,27 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-app = FastAPI()
 
-@app.on_event("startup")
-async def startup():
-    engine = sqlalchemy.create_engine(
-        DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
-    )
-    metadata.create_all(engine)
-    await database.connect()
-
-@app.on_event("shutdown")
-async def shutdown():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    # Выбираем правильный драйвер в зависимости от типа БД
+    if "postgresql" in DATABASE_URL or "postgres" in DATABASE_URL:
+        # Для PostgreSQL используем asyncpg напрямую через databases
+        await database.connect()
+    else:
+        # Для SQLite используем SQLAlchemy
+        engine = sqlalchemy.create_engine(
+            DATABASE_URL, connect_args={"check_same_thread": False}
+        )
+        metadata.create_all(engine)
+        await database.connect()
+    yield
+    # Shutdown
     await database.disconnect()
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -449,21 +458,18 @@ async def post_comment(user_id: str, msg: MessageIn, request: Request):
     if len(text) < 2:
         return {"error": "Комментарий слишком короткий."}
 
-    # Сохраняем
-    all_messages = load_messages()
-    if user_id not in all_messages:
-        all_messages[user_id] = []
-        
+    # Сохраняем в базу данных
     comment_id = uuid.uuid4().hex[:6]
-    all_messages[user_id].append({
-        "id": comment_id,
-        "text": text,
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    })
-    # Храним последние 100 комментариев для каждого пользователя
-    if len(all_messages[user_id]) > 100:
-        all_messages[user_id] = all_messages[user_id][-100:]
-    save_messages(all_messages)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    
+    query = comments.insert().values(
+        id=comment_id,
+        user_id=user_id,
+        text=text,
+        timestamp=timestamp,
+        target_name=None  # Будет обновлено при получении
+    )
+    await database.execute(query)
 
     # Обновляем рейт-лимит
     rate_limiter[client_ip] = now
@@ -486,13 +492,13 @@ async def delete_comment(user_id: str, comment_id: str, request: Request):
     if auth != f"Bearer {ADMIN_PASSWORD}":
         return {"error": "Неверный пароль администратора."}
         
-    all_messages = load_messages()
-    if user_id in all_messages:
-        original_len = len(all_messages[user_id])
-        all_messages[user_id] = [m for m in all_messages[user_id] if m.get("id") != comment_id]
-        if len(all_messages[user_id]) < original_len:
-            save_messages(all_messages)
-            return {"ok": True}
+    query = comments.delete().where(
+        (comments.c.user_id == user_id) & (comments.c.id == comment_id)
+    )
+    result = await database.execute(query)
+    
+    if result:
+        return {"ok": True}
     return {"error": "Комментарий не найден."}
 
 @app.get("/api/latest_comments")
@@ -501,19 +507,19 @@ async def get_latest_comments():
     guild = bot.get_guild(GUILD_ID)
     if not guild: return {"comments": []}
     
-    all_messages = load_messages()
-    flat_comments = []
+    # Получаем последние 10 комментариев из базы данных
+    query = comments.select().order_by(comments.c.timestamp.desc()).limit(10)
+    rows = await database.fetch_all(query)
     
-    for uid, comments in all_messages.items():
-        member = guild.get_member(int(uid))
-        if not member: continue
-        for c in comments:
-            c_copy = c.copy()
-            c_copy["target_name"] = member.display_name
-            flat_comments.append(c_copy)
-            
-    flat_comments.sort(key=lambda x: x["timestamp"], reverse=True)
-    return {"comments": flat_comments[:10]}
+    comments_list = []
+    for row in rows:
+        member = guild.get_member(int(row["user_id"]))
+        if member:
+            comment_dict = dict(row)
+            comment_dict["target_name"] = member.display_name
+            comments_list.append(comment_dict)
+    
+    return {"comments": comments_list}
 
 @app.get("/", response_class=HTMLResponse)
 async def get_index_page():
